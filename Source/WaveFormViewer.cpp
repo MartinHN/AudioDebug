@@ -27,7 +27,8 @@ cursorPos(0),
 hoverCursorX(0),
 sampleRate(44100),
 BPM(60),
-tickPerBeat(1)
+tickPerBeat(1),
+channel(-1)
 
 
 {
@@ -38,10 +39,21 @@ WaveFormViewer::~WaveFormViewer(){
 }
 void WaveFormViewer::setRefBuffer(AudioBuffer<float> & ref,int channelToLook){
   levelsDirty = true;
-  levels.clear();
+
   samplesRef = &ref;
   channel =channelToLook ;
-
+  {
+    ScopedLock lk(levels.getLock());
+    if(channel<0)levels.resize(samplesRef->getNumChannels());
+    else levels.resize(1);
+    for(auto & l : levels){
+      l.resize(getBufferROI().getLength()/samplePerPoint);
+      for(auto &r:l){
+        r.setStart(0);
+        r.setEnd(0);
+      }
+    }
+  }
   setZoom  (getBufferROI());
 
 
@@ -58,23 +70,38 @@ Range<int> WaveFormViewer::getCurrentZoom(){
 void WaveFormViewer::updateLevels(int start, int num){
   if(!hasValidSampleRef())return;
   ScopedLock lk(levels.getLock());
-  bool changedSize = levels.size()*samplePerPoint != getBufferROI().getLength();
+  if(channel<0)levels.resize(samplesRef->getNumChannels());
+  else levels.resize(1);
+  for(auto & l : levels){
+    l.resize(getBufferROI().getLength()/samplePerPoint);
+
+  }
+  bool hasLevels = levels.size() && levels[0].size();
+  bool changedSize = hasLevels && levels[0].size()*samplePerPoint != getBufferROI().getLength();
 
   bool targetLevelIsNull = true;
-  if(levels.size()){
-    Range<float> testedLevel = levels[jmin(levels.size()-1,start/samplePerPoint + 1)];
+  if(hasLevels){
+    Range<float> testedLevel = levels[0][jmin(levels.size()-1,start/samplePerPoint + 1)];
     targetLevelIsNull= levels.size()>0 && testedLevel.getStart()==0 &&testedLevel.getEnd()==0;
   }
   if(changedSize || targetLevelIsNull || ( needNewSamplePerPoint())){
-    levels.resize(getBufferROI().getLength()/samplePerPoint);
+
     int startIdx = start/samplePerPoint;
-    int endIdx = num<0?levels.size():jmin(levels.size(),startIdx+num/samplePerPoint);
-    if(startIdx==0 && endIdx==levels.size()){
+    int endIdx = num<0?levels[0].size():jmin(levels[0].size(),startIdx+num/samplePerPoint);
+    if(startIdx==0 && endIdx==levels[0].size()){
       int dbg;
       dbg++;
     }
-    for(int i = startIdx ; i < endIdx ; i++){
-      levels.getReference(i) = FloatVectorOperations::findMinAndMax(samplesRef->getReadPointer(channel)+(i*samplePerPoint), samplePerPoint);
+
+    for(int c = 0 ; c< levels.size() ; c++){
+      Array<Range<float> >* cL = &levels.getReference(c);
+      for(int i = startIdx ; i < endIdx ; i++){
+        cL->getReference(i) = FloatVectorOperations::findMinAndMax(samplesRef->getReadPointer(channel>=0?channel:c)+(i*samplePerPoint), samplePerPoint);
+        if(cL->getReference(i).getLength()>0){
+          int dbg;
+          dbg++;
+        }
+      }
     }
     levelsDirty = false;
     generatePath();
@@ -113,8 +140,9 @@ void WaveFormViewer::setZoom(Range<int> visible,bool allowUniLateralScaling,bool
 
       if(needNewSamplePerPoint()){
         updateLevels();
+
       }
-      generatePath();
+generatePath();
     }
   }
   else{
@@ -163,32 +191,51 @@ void WaveFormViewer::generatePath(){
     postCommandMessage(commands::updatePath);
     return;
   }
-
-  path.clear();
+  {
+ScopedLock lk(levels.getLock());
+  for(auto & path:paths){path.clear();}
+  }
   if(getNumPointsDisplayed()==0)return;
+
   {
     ScopedLock lk(levels.getLock());
+    if(levels.size()==0)return;
     Rectangle<int > area = getLocalBounds();
     float startView = visibleSample.getStart()*1.0f/samplePerPoint;
-    float endView = jmin(levels.size()-1.0f,visibleSample.getEnd()*1.0f/samplePerPoint);
+    float endView = jmin(levels[0].size()-1.0f,visibleSample.getEnd()*1.0f/samplePerPoint);
 
     int pathOffsetX = startView<0?-startView*pixelsPerPoint:0;
     startView = jmax(0.0f,startView);
-    Point<float> startPoint (area.getX()+pathOffsetX,area.getBottom()/2);
-    float heightZoom = area.getHeight()*verticalZoom/2;
+
+
 
     pixelsPerPoint = area.getWidth()*1.0/getNumPointsDisplayed();
-    path.startNewSubPath(startPoint);
 
 
-    for(int i = startView ; i <= endView ; i++){
-      path.lineTo(startPoint.getX() + (i-startView)*pixelsPerPoint,startPoint.getY() +1+ levels[i].getEnd()*heightZoom);
+    paths.resize(levels.size());
+
+    float pathHeight = area.getHeight()*1.0/paths.size();
+    float heightZoom = pathHeight*verticalZoom/2.0;
+    Point<float> startPoint (area.getX()+pathOffsetX,area.getY()+pathHeight/2.0);
+    int idx = 0;
+    for(auto & path:paths){
+      Array<Range<float> > * cL = &levels.getReference(idx);
+
+
+
+      path.startNewSubPath(startPoint);
+      for(int i = startView ; i <= endView ; i++){
+        path.lineTo(startPoint.getX() + (i-startView)*pixelsPerPoint,startPoint.getY() +1- cL->getReference(i).getEnd()*heightZoom);
+      }
+      for(int i = endView; i >= startView ; i--){
+        path.lineTo(startPoint.getX() +(i-startView)*pixelsPerPoint,startPoint.getY() -cL->getReference(i).getStart()*heightZoom);
+      }
+      path.closeSubPath();
+
+      idx++;
+      startPoint.y+=pathHeight;
+
     }
-
-    for(int i = endView; i >= startView ; i--){
-      path.lineTo(startPoint.getX() +(i-startView)*pixelsPerPoint,startPoint.getY() +levels[i].getStart()*heightZoom);
-    }
-    path.closeSubPath();
   }
   repaint();
 }
@@ -271,16 +318,28 @@ void WaveFormViewer::paint(Graphics & g){
   Rectangle < int> area = getLocalBounds();
   g.fillAll(backColour);
 
-  g.setColour(envelopColour);
-  g.fillPath(path);
+g.setColour(envelopColour);
+  for(auto & path:paths){
+
+//    g.fillRectList(path);
+
+
+
+    g.fillPath(path);
+
+
+  }
 
   g.setColour(Colours::black);
   g.drawText(String(jmax(0,visibleSample.getStart())), area, Justification::bottomLeft);
   g.drawText(String(jmin(visibleSample.getEnd(),getBufferROI().getEnd())), area, Justification::bottomRight);
 
   int mouseSample = screenToSample(hoverCursorX);
+  String mouseInfo = "mouse ( x : "+String(mouseSample)+", y : ";
+  for(auto &l:levels){mouseInfo+=String(l[mouseSample/samplePerPoint].getStart())+", ";};
+  mouseInfo= mouseInfo.substring(0, mouseInfo.length()-2)+ ")";
   String cursors = "cursor ("+String(cursorPos)+") || "+
-  "mouse ( x : "+String(mouseSample)+", y : "+String(levels[mouseSample/samplePerPoint].getStart())+ ") || "+
+  mouseInfo+" || "+
   "BPM : "+String(BPM);
   g.drawText(cursors, area, Justification::centredBottom);
 
@@ -310,3 +369,5 @@ Range<int> WaveFormViewer::getBufferROI(){
   
   
 }
+
+int WaveFormViewer::getNumChannels(){return samplesRef->getNumChannels();}

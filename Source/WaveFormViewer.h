@@ -20,7 +20,7 @@ public:
   WaveFormViewer();
   ~WaveFormViewer();
 
-  void setRefBuffer(AudioBuffer<float> & ref,int channelToLook);
+  void setRefBuffer(AudioBuffer<float> & ref,int channelToLook=-1);
   void paint(Graphics & g)override;
   void updateLevels(int start = 0 , int end = -1);
   void setZoom(Range<int> zoom,bool allowUniLateralScaling=true,bool notify = true);
@@ -30,6 +30,8 @@ public:
   void setSampleRate(float sR);
   Range<int> getCurrentZoom();
 
+
+  int getNumChannels();
   Colour envelopColour,backColour,tickColour;
 
   void resized() override;
@@ -106,9 +108,9 @@ protected:
 private:
   void handleCommandMessage(int commandId)override;
 
-  Array<Range<float>,CriticalSection > levels;
+  Array<Array<Range<float> >,CriticalSection > levels;
 
-  Path path;
+  Array<Path> paths;
 
   AudioBuffer<float> * samplesRef;
 };

@@ -16,15 +16,15 @@
 
 class BufferViewer : public Component,Button::Listener,Thread,AsyncUpdater{
 public:
-  BufferViewer(const String & path):Thread("Pipe : "+path){
+  BufferViewer(const String & path):Thread("Pipe : "+getCanonicalName(path)){
 
     blockSize = 4096;
     buffer.setSize(1,4*blockSize);
     buffer.clear();
-    jassert(inPipe.openExisting(path));
+    openForPath(path);
     startThread();
-    enveloppe.setRefBuffer(buffer,0);
-    writeNeedle = 0;
+    enveloppe.setRefBuffer(buffer);
+
     addAndMakeVisible(enveloppe);
     clearB.setClickingTogglesState(true);
     clearB.setButtonText("auto clear");
@@ -33,17 +33,47 @@ public:
     clearB.addListener(this);
 
 
+
   }
 
   ~BufferViewer(){
 
     stopThread(1000);
   }
+  void openForPath(const String & path){
+    if(canonicalName==""){
+      canonicalName = getCanonicalName(path);
+    }
+    int numChannel = channelFromPath(path)+1;
+    ScopedLock lk(inPipes.getLock());
+    int curSize = inPipes.size();
+    jassert(numChannel>=curSize);
+    for(int i = curSize ; i < numChannel ; i++){
+      inPipes.add(new NamedPipe());//jmax(numChannel,inPipes.size()));
+      jassert(inPipes.getLast()->openExisting(canonicalName+String(i)));
 
-template<typename T>
+    }
+    writeNeedles.resize(numChannel);
+
+  }
+  int channelFromPath(const String & path){
+    if(isdigit(path[path.length() - 1])){return path[path.length() - 1]-48;}
+    else{return 0;}
+
+  }
+ static  String getCanonicalName(const String & path ){
+    if(isdigit(path[path.length() - 1])){return path.substring(0, path.length()-1);}
+    else{return path;}
+
+  }
+  template<typename T>
   int tryReadBlockSize(NamedPipe & pipe,T * dest,int bS){
+    if(!pipe.isOpen()){
+      return -1;
+    }
     int idx = 0;
     while(idx<bS ){
+
       int read = pipe.read(dest+idx, 1*sizeof(T), 30);
       if(threadShouldExit())return -1;
       if(read<0){
@@ -65,37 +95,47 @@ template<typename T>
   }
   void run() override{
     while (!threadShouldExit()){
-      if(writeNeedle+blockSize>buffer.getNumSamples()){
-        buffer.setSize(buffer.getNumChannels(), buffer.getNumSamples()+blockSize,true);
+      ScopedLock lk(inPipes.getLock());
+      if(getLastWriteNeedle()+blockSize>buffer.getNumSamples()){
+        buffer.setSize(buffer.getNumChannels(), buffer.getNumSamples()+blockSize,true,true);
       }
 
-      int read = tryReadBlockSize<float>(inPipe,buffer.getWritePointer(0)+writeNeedle, blockSize); //inPipe.read(buffer.getWritePointer(0)+writeNeedle, blockSize*sizeof(float), -1);
-      int numSamples = read;
-      if(numSamples < 0){
-        if(writeNeedle>0){
-          enveloppe.bufferROI.setEnd(writeNeedle+1);
-          triggerAsyncUpdate();
-          if(clearB.getToggleState())isOld=true;
+      int idx = 0;
+      for(auto &inPipe : inPipes){
+
+        if(inPipes.size()>buffer.getNumChannels()){
+          buffer.setSize(inPipes.size(),buffer.getNumSamples(),true,true);
+          enveloppe.setRefBuffer(buffer);
         }
-        writeNeedle = 0;
-      }
-      if(numSamples>0){
-
-        if(isOld){
-          for(int i = 0 ; i < numSamples ; i++){
-            buffer.setSample(0, i, buffer.getSample(0,writeNeedle+i));
+        int read = tryReadBlockSize<float>(*inPipe,buffer.getWritePointer(idx)+writeNeedles[idx], blockSize); //inPipe.read(buffer.getWritePointer(0)+writeNeedle, blockSize*sizeof(float), -1);
+        int numSamples = read;
+        if(numSamples <= 1 ){
+          if(writeNeedles[idx]>0){
+            
+            triggerAsyncUpdate();
+            if(clearB.getToggleState())isOld=true;
           }
-          writeNeedle =0;
-          isOld = false;
+          writeNeedles.getReference(idx) = 0;
         }
+        if(numSamples>0){
 
-        enveloppe.updateLevels(writeNeedle,numSamples);
-        writeNeedle+=numSamples;
-//        DBG("read : " << numSamples << "," << writeNeedle+1);
+          if(isOld){
+            for(int i = 0 ; i < numSamples ; i++){
+              buffer.setSample(idx, i, buffer.getSample(0,writeNeedles[idx]+i));
+            }
+            writeNeedles.getReference(idx) =0;
+            isOld = false;
+          }
+
+          enveloppe.updateLevels(writeNeedles[idx],numSamples);
+          writeNeedles.getReference(idx)+=numSamples;
+          //        DBG("read : " << numSamples << "," << writeNeedle+1);
 
 
 
-        triggerAsyncUpdate();
+          triggerAsyncUpdate();
+        }
+        idx++;
       }
 
       if(msgPipe.isOpen()){
@@ -106,6 +146,13 @@ template<typename T>
     }
   }
 
+  int getLastWriteNeedle(){
+    int res=0;
+    for(auto & w:writeNeedles){
+      res = jmax(w,res);
+    }
+    return res;
+  }
   void processMessage(const String & msg){
     DBG(msg);
     StringArray arr;
@@ -126,7 +173,7 @@ template<typename T>
     }
   }
   void handleAsyncUpdate()override{
-    enveloppe.setZoomMax();
+//    enveloppe.setZoomMax();
   }
 
   void buttonClicked(Button * b) override{
@@ -135,7 +182,7 @@ template<typename T>
 
   void paintOverChildren(Graphics & g) override{
     g.setColour(Colours::white);
-    g.drawText(getThreadName(), getLocalBounds().removeFromLeft(300), Justification::centredLeft);
+    g.drawText(canonicalName+"_"+String(enveloppe.getNumChannels()), getLocalBounds().removeFromLeft(300), Justification::centredLeft);
 
   }
 
@@ -143,7 +190,7 @@ template<typename T>
     g.fillAll(Colours::black);
   }
   void resized()override{
-    
+
     Rectangle<int> area = getLocalBounds();
     Rectangle<int> ctlPanel = area.removeFromTop(30);
     clearB.setBounds(ctlPanel);
@@ -152,9 +199,12 @@ template<typename T>
 
 
 
-  NamedPipe inPipe,msgPipe;
+  OwnedArray<NamedPipe,CriticalSection> inPipes;
+  NamedPipe msgPipe;
   WaveFormViewer enveloppe;
-  int writeNeedle,lastUpdatedWrite;
+  String canonicalName;
+  Array<int> writeNeedles;
+  int lastUpdatedWrite;
 
   int blockSize ;
   char  msg[2048];
@@ -189,13 +239,17 @@ public:
       }
     }
     else{
-    if(idxOfBuffer(path) < 0){
-      BufferViewer * b=new BufferViewer(path);
-      b->enveloppe.listeners.add(this);
-      addAndMakeVisible(b);
-      buffers.add(b);
-    }
-    resized();
+      int idx = idxOfBuffer(path);
+      if(idx< 0){
+        BufferViewer * b=new BufferViewer(path);
+        b->enveloppe.listeners.add(this);
+        addAndMakeVisible(b);
+        buffers.add(b);
+      }
+      else{
+        buffers[idx]->openForPath(path);
+      }
+      resized();
     }
   }
 
@@ -212,8 +266,9 @@ public:
 
   int idxOfBuffer(const String & p){
     int i = 0;
+    String can = BufferViewer::getCanonicalName(p);
     for ( auto & b:buffers){
-      if(b->inPipe.getName()==p){
+      if(b->canonicalName==can){
         return i;
       }
       i++;
@@ -263,7 +318,7 @@ public:
       else{
         float pos =o->cursorPos;
         for(auto & b:buffers){
-          
+
           if(&b->enveloppe!=o){
             double ratio = o->BPM/b->enveloppe.BPM;
             b->enveloppe.setCursorPos(pos*ratio,false);
